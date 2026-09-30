@@ -563,3 +563,288 @@ apply_update_permissions() {
     chmod_core_tree
 
     if [[ -d "${NC_DIR}/data" ]]; then
+        chown "${WEB_USER}:${WEB_GROUP}" "${NC_DIR}/data" || true
+
+        if [[ -f "${NC_DIR}/data/.htaccess" ]]; then
+            chown "${ROOT_USER}:${WEB_GROUP}" "${NC_DIR}/data/.htaccess" || true
+        fi
+    fi
+
+    log "Update permissions applied"
+}
+
+restore_locked_permissions() {
+    log "Restoring locked-down Nextcloud permissions"
+
+    # Do not create ${NC_DIR}/assets here.
+    # A root-level assets directory breaks Nextcloud updater validation.
+    mkdir -p "${NC_DIR}/data"
+    mkdir -p "${NC_DIR}/updater"
+
+    chmod_core_tree
+
+    log "Setting root ownership for non-writable core areas"
+
+    chown "${ROOT_USER}:${WEB_GROUP}" "${NC_DIR}"
+
+    while IFS= read -r -d '' item; do
+        case "$(basename "${item}")" in
+            apps|config|data|themes|updater)
+                ;;
+            *)
+                chown -R "${ROOT_USER}:${WEB_GROUP}" "${item}" >> "${LOG_FILE}" 2>&1
+                ;;
+        esac
+    done < <(find "${NC_DIR}" -mindepth 1 -maxdepth 1 -print0)
+
+    log "Setting webserver ownership for writable Nextcloud areas"
+
+    [[ -d "${NC_DIR}/apps" ]] && chown -R "${WEB_USER}:${WEB_GROUP}" "${NC_DIR}/apps" >> "${LOG_FILE}" 2>&1
+    [[ -d "${NC_DIR}/config" ]] && chown -R "${WEB_USER}:${WEB_GROUP}" "${NC_DIR}/config" >> "${LOG_FILE}" 2>&1
+    [[ -d "${NC_DIR}/themes" ]] && chown -R "${WEB_USER}:${WEB_GROUP}" "${NC_DIR}/themes" >> "${LOG_FILE}" 2>&1
+    [[ -d "${NC_DIR}/updater" ]] && chown -R "${WEB_USER}:${WEB_GROUP}" "${NC_DIR}/updater" >> "${LOG_FILE}" 2>&1
+
+    if [[ -d "${NC_DIR}/data" ]]; then
+        if [[ "${TOUCH_DATA_PERMISSIONS}" == "true" ]]; then
+            log "Recursively setting data ownership because TOUCH_DATA_PERMISSIONS=true"
+            chown -R "${WEB_USER}:${WEB_GROUP}" "${NC_DIR}/data" >> "${LOG_FILE}" 2>&1
+        else
+            log "Setting only top-level data directory ownership"
+            chown "${WEB_USER}:${WEB_GROUP}" "${NC_DIR}/data" >> "${LOG_FILE}" 2>&1 || true
+        fi
+    fi
+
+    chmod +x "${NC_DIR}/occ"
+
+    if [[ -f "${NC_DIR}/.htaccess" ]]; then
+        chmod 0644 "${NC_DIR}/.htaccess"
+        chown "${ROOT_USER}:${WEB_GROUP}" "${NC_DIR}/.htaccess"
+    fi
+
+    if [[ -f "${NC_DIR}/data/.htaccess" ]]; then
+        chmod 0644 "${NC_DIR}/data/.htaccess"
+        chown "${ROOT_USER}:${WEB_GROUP}" "${NC_DIR}/data/.htaccess"
+    fi
+
+    log "Locked-down permissions restored"
+}
+
+interactive_failure_menu() {
+    local failed_step="$1"
+    local choice
+
+    while true; do
+        echo
+        echo "Step failed:"
+        echo "  ${failed_step}"
+        echo
+        echo "Last log lines:"
+        tail -n 50 "${LOG_FILE}" || true
+        echo
+        echo "Choose:"
+        echo "  1) Open root shell so I can fix the issue manually"
+        echo "  2) Retry this step"
+        echo "  3) Re-apply update permissions and retry this step"
+        echo "  4) Restore locked permissions, disable maintenance mode and exit"
+        echo "  5) Exit and keep maintenance mode enabled"
+        echo
+        read -r -p "Choice [1/2/3/4/5]: " choice
+
+        case "${choice}" in
+            1)
+                echo
+                echo "Opening root shell. Exit the shell to return to the updater menu."
+                echo
+                /bin/bash
+                ;;
+            2|"")
+                return 0
+                ;;
+            3)
+                apply_update_permissions
+                return 0
+                ;;
+            4)
+                restore_locked_permissions || true
+                set_maintenance_off || true
+                echo "Exited after restoring locked permissions and disabling maintenance mode."
+                exit 1
+                ;;
+            5)
+                echo "Exited. Maintenance mode may still be enabled."
+                exit 1
+                ;;
+            *)
+                echo "Invalid choice."
+                ;;
+        esac
+    done
+}
+
+run_nextcloud_updater_once() {
+    local step_log
+    local rc
+
+    step_log="$(mktemp)"
+    TEMP_FILES+=("${step_log}")
+
+    set +e
+    sudo -E -u "${WEB_USER}" "${PHP_BIN}" \
+        --define apc.enable_cli=1 \
+        "${NC_DIR}/updater/updater.phar" \
+        --no-interaction > "${step_log}" 2>&1
+    rc=$?
+    set -e
+
+    cat "${step_log}" >> "${LOG_FILE}"
+
+    if [[ "${rc}" -eq 0 ]]; then
+        rm -f "${step_log}"
+        return 0
+    fi
+
+    if grep -q "Update of code successful" "${step_log}" \
+        && grep -Eq "Call to undefined function NC\\\\Updater\\\\system|Call to undefined function.*system\\(" "${step_log}"; then
+
+        log "Updater code replacement completed successfully."
+        log "Updater failed only when trying to auto-run occ upgrade because PHP system() is disabled."
+        log "Continuing with manual occ upgrade from this script."
+
+        rm -f "${step_log}"
+        return 10
+    fi
+
+    rm -f "${step_log}"
+    return "${rc}"
+}
+
+run_update() {
+    local rc
+
+    while true; do
+        log "Starting Nextcloud command-line updater"
+
+        if run_nextcloud_updater_once; then
+            break
+        else
+            rc=$?
+
+            if [[ "${rc}" -eq 10 ]]; then
+                break
+            fi
+
+            interactive_failure_menu "Nextcloud updater.phar"
+        fi
+    done
+
+    while true; do
+        log "Running occ upgrade explicitly"
+
+        if run_as_web -n upgrade >> "${LOG_FILE}" 2>&1; then
+            break
+        fi
+
+        interactive_failure_menu "occ upgrade"
+    done
+}
+
+apply_custom_theme() {
+    if ! custom_theme_enabled; then
+        log "No custom theme configured, skipping theme re-apply"
+        return 0
+    fi
+
+    CUSTOM_THEME_DIR="${NC_DIR}/themes/${CUSTOM_THEME_NAME}"
+
+    if [[ ! -d "${CUSTOM_THEME_DIR}" ]]; then
+        fail "Custom theme directory missing after update: ${CUSTOM_THEME_DIR}"
+    fi
+
+    log "Re-applying custom theme: ${CUSTOM_THEME_NAME}"
+
+    run_as_web config:system:set theme --value="${CUSTOM_THEME_NAME}" --type=string >> "${LOG_FILE}" 2>&1 \
+        || fail "Could not set theme=${CUSTOM_THEME_NAME}"
+
+    log "Refreshing custom theme cache"
+    run_as_web maintenance:theme:update >> "${LOG_FILE}" 2>&1 || true
+
+    log "Current configured theme: $(run_as_web config:system:get theme 2>/dev/null || echo unknown)"
+}
+
+post_update() {
+    log "Running maintenance repair"
+    run_as_web -n maintenance:repair >> "${LOG_FILE}" 2>&1 || fail "maintenance:repair failed"
+
+    log "Updating .htaccess"
+    run_as_web -n maintenance:update:htaccess >> "${LOG_FILE}" 2>&1 || true
+
+    apply_custom_theme
+
+    log "Saving Nextcloud app list after update"
+    run_as_web app:list > "${BACKUP_DIR}/app-list-after.txt" 2>> "${LOG_FILE}" || true
+
+    log "Saving Nextcloud status after update"
+    run_as_web status > "${BACKUP_DIR}/status-after.txt" 2>> "${LOG_FILE}" || true
+}
+
+run_expensive_post_upgrade_maintenance() {
+    if [[ "${RUN_EXPENSIVE_REPAIR}" == "true" ]]; then
+        while true; do
+            log "Running expensive repair: occ maintenance:repair --include-expensive"
+
+            if run_as_web -n maintenance:repair --include-expensive >> "${LOG_FILE}" 2>&1; then
+                break
+            fi
+
+            interactive_failure_menu "occ maintenance:repair --include-expensive"
+        done
+    else
+        log "Skipping expensive repair because RUN_EXPENSIVE_REPAIR=${RUN_EXPENSIVE_REPAIR}"
+    fi
+
+    if [[ "${RUN_MISSING_INDICES}" == "true" ]]; then
+        while true; do
+            log "Adding missing database indices: occ db:add-missing-indices"
+
+            if run_as_web -n db:add-missing-indices >> "${LOG_FILE}" 2>&1; then
+                break
+            fi
+
+            interactive_failure_menu "occ db:add-missing-indices"
+        done
+    else
+        log "Skipping missing database indices because RUN_MISSING_INDICES=${RUN_MISSING_INDICES}"
+    fi
+
+    if [[ "${RUN_MISSING_COLUMNS}" == "true" ]]; then
+        while true; do
+            log "Adding missing database columns: occ db:add-missing-columns"
+
+            if run_as_web -n db:add-missing-columns >> "${LOG_FILE}" 2>&1; then
+                break
+            fi
+
+            interactive_failure_menu "occ db:add-missing-columns"
+        done
+    else
+        log "Skipping missing database columns because RUN_MISSING_COLUMNS=${RUN_MISSING_COLUMNS}"
+    fi
+
+    if [[ "${RUN_MISSING_PRIMARY_KEYS}" == "true" ]]; then
+        while true; do
+            log "Adding missing database primary keys: occ db:add-missing-primary-keys"
+
+            if run_as_web -n db:add-missing-primary-keys >> "${LOG_FILE}" 2>&1; then
+                break
+            fi
+
+            interactive_failure_menu "occ db:add-missing-primary-keys"
+        done
+    else
+        log "Skipping missing primary keys because RUN_MISSING_PRIMARY_KEYS=${RUN_MISSING_PRIMARY_KEYS}"
+    fi
+
+    if [[ "${RUN_FILECACHE_BIGINT}" == "true" ]]; then
+        while true; do
+            log "Converting filecache bigint columns: occ db:convert-filecache-bigint"
+
