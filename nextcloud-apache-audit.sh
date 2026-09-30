@@ -481,3 +481,51 @@ set +o pipefail
         awk -F '\t' '$5 ~ /^[0-9]+$/ && $5 >= 3 { print $1, $2, $3, $4, "level=" $5, $6 }' "$NC_TSV" \
             | head -n 200
     else
+        grep -E '"level"[[:space:]]*:[[:space:]]*[34]' "$NC_RAW" | head -n 200 || true
+    fi
+
+    section "20. Cross-check - IPs appearing in both Apache failures and Nextcloud auth failures"
+    if [[ $JQ_AVAILABLE -eq 1 ]]; then
+        awk -F '\t' '($4 == "401" || $4 == "403" || $4 == "404" || $4 == "429") && $1 != "-" { print $1 }' "$ACCESS_TSV" \
+            | sort -u > "$TMPDIR_AUDIT/apache-bad-ips.txt"
+
+        awk -F '\t' '
+            {
+                m=tolower($6)
+                if (m ~ /(login failed|failed login|brute.?force|invalid password|password.*invalid|two-factor.*failed|authentication.*failed|could not verify|not authenticated)/ && $2 != "-")
+                    print $2
+            }
+        ' "$NC_TSV" | sort -u > "$TMPDIR_AUDIT/nc-bad-ips.txt"
+
+        comm -12 "$TMPDIR_AUDIT/apache-bad-ips.txt" "$TMPDIR_AUDIT/nc-bad-ips.txt" | head -n "$TOP_N" || true
+    else
+        echo "jq not installed: structured correlation unavailable."
+    fi
+
+    section "Interpretation"
+    cat <<'TXT'
+High-signal indicators:
+  - Exploit/scanner URI probes, especially when followed by HTTP 2xx/3xx.
+  - TRACE/TRACK/CONNECT/DEBUG requests from external sources.
+  - Repeated Nextcloud login failures or brute-force messages from one IP.
+  - The same IP appearing in both Apache failures and Nextcloud auth failures.
+  - Security-relevant Nextcloud messages combined with unusual Apache activity.
+  - Legacy Nextcloud desktop clients repeatedly producing DAV 5xx responses.
+  - mod_evasive denials affecting expected internal or trusted clients.
+
+Usually lower-signal/noisy by themselves:
+  - A handful of 404s from arbitrary Internet scanners.
+  - WebDAV methods such as PROPFIND, PUT, DELETE, MOVE, COPY, LOCK and UNLOCK.
+  - A small number of 401/403 responses.
+  - Nextcloud warnings/errors without a matching hostile request pattern.
+  - A legacy client by itself is an operational/security-maintenance issue, not proof of compromise.
+
+This is triage, not an IDS. Validate high-signal findings against the full source lines,
+reverse proxy/CDN configuration, known admin IPs, fail2ban/CrowdSec, firewall logs,
+and Nextcloud's own brute-force protection state before blocking anything.
+TXT
+
+} | tee "$REPORT_FILE"
+
+echo
+echo "Report written to: $REPORT_FILE"
