@@ -848,3 +848,285 @@ run_expensive_post_upgrade_maintenance() {
         while true; do
             log "Converting filecache bigint columns: occ db:convert-filecache-bigint"
 
+            if run_as_web -n db:convert-filecache-bigint >> "${LOG_FILE}" 2>&1; then
+                break
+            fi
+
+            interactive_failure_menu "occ db:convert-filecache-bigint"
+        done
+    else
+        log "Skipping filecache bigint conversion because RUN_FILECACHE_BIGINT=${RUN_FILECACHE_BIGINT}"
+    fi
+}
+
+run_core_integrity_check() {
+    if [[ "${RUN_CORE_INTEGRITY}" != "true" ]]; then
+        log "Skipping core integrity check because RUN_CORE_INTEGRITY=${RUN_CORE_INTEGRITY}"
+        return 0
+    fi
+
+    log "Running core integrity check"
+
+    if run_as_web integrity:check-core > "${BACKUP_DIR}/integrity-check-core-after.txt" 2>> "${LOG_FILE}"; then
+        log "Core integrity check completed"
+    else
+        log "Core integrity check reported issues. See ${BACKUP_DIR}/integrity-check-core-after.txt"
+    fi
+
+    cat "${BACKUP_DIR}/integrity-check-core-after.txt" >> "${LOG_FILE}" || true
+}
+
+validate_admin_ranges_json() {
+    local json="$1"
+
+    "${PHP_BIN}" -r '
+        $json = $argv[1];
+        $decoded = json_decode($json, true);
+
+        if (!is_array($decoded)) {
+            fwrite(STDERR, "Value must be a JSON array.\n");
+            exit(1);
+        }
+
+        $out = [];
+
+        foreach ($decoded as $value) {
+            if (!is_string($value) || trim($value) === "") {
+                fwrite(STDERR, "Each allowed_admin_ranges entry must be a non-empty string.\n");
+                exit(1);
+            }
+
+            $out[] = $value;
+        }
+
+        echo json_encode(array_values($out), JSON_UNESCAPED_SLASHES);
+    ' "${json}"
+}
+
+set_allowed_admin_ranges_json() {
+    local requested_json="$1"
+    local normalized_json
+
+    if ! normalized_json="$(validate_admin_ranges_json "${requested_json}")"; then
+        fail "Invalid allowed_admin_ranges JSON: ${requested_json}"
+    fi
+
+    log "Setting allowed_admin_ranges to: ${normalized_json}"
+
+    run_as_web config:system:set allowed_admin_ranges --type=json --value="${normalized_json}" >> "${LOG_FILE}" 2>&1 \
+        || fail "Could not set allowed_admin_ranges"
+}
+
+check_and_control_debug() {
+    if [[ "${CHECK_DEBUG_PRODUCTION}" != "true" ]]; then
+        log "Skipping debug production check because CHECK_DEBUG_PRODUCTION=${CHECK_DEBUG_PRODUCTION}"
+        return 0
+    fi
+
+    local debug_value choice
+
+    debug_value="$(get_config_value debug || true)"
+
+    if is_config_true "${debug_value}"; then
+        log "WARNING: Nextcloud debug=true is enabled. This should not be enabled in production."
+
+        case "${AUTO_DISABLE_DEBUG}" in
+            true)
+                log "Automatically setting debug=false"
+                run_as_web config:system:set debug --value=false --type=boolean >> "${LOG_FILE}" 2>&1 \
+                    || fail "Could not set debug=false"
+                ;;
+            false)
+                log "Leaving debug=true because AUTO_DISABLE_DEBUG=false"
+                ;;
+            ask|"")
+                echo
+                echo "WARNING: Nextcloud debug=true is enabled."
+                echo "Production systems should normally use debug=false."
+                echo
+                echo "Choose:"
+                echo "  1) Set debug=false - recommended"
+                echo "  2) Leave debug=true"
+                echo "  3) Abort"
+                echo
+                read -r -p "Choice [1/2/3]: " choice
+
+                case "${choice}" in
+                    1|"")
+                        log "Setting debug=false"
+                        run_as_web config:system:set debug --value=false --type=boolean >> "${LOG_FILE}" 2>&1 \
+                            || fail "Could not set debug=false"
+                        ;;
+                    2)
+                        log "Leaving debug=true by user choice"
+                        ;;
+                    3)
+                        echo "Aborted."
+                        exit 0
+                        ;;
+                    *)
+                        echo "Invalid choice."
+                        exit 1
+                        ;;
+                esac
+                ;;
+            *)
+                fail "Invalid AUTO_DISABLE_DEBUG value: ${AUTO_DISABLE_DEBUG}"
+                ;;
+        esac
+    else
+        log "Production debug check OK: debug is false or not set"
+    fi
+}
+
+control_allowed_admin_ranges() {
+    local current_ranges choice custom_json
+
+    current_ranges="$(get_config_value allowed_admin_ranges || true)"
+    [[ -n "${current_ranges}" ]] || current_ranges="[]"
+
+    log "Current allowed_admin_ranges: ${current_ranges}"
+
+    case "${ALLOWED_ADMIN_RANGES_MODE}" in
+        skip)
+            log "Skipping allowed_admin_ranges control because ALLOWED_ADMIN_RANGES_MODE=skip"
+            return 0
+            ;;
+
+        enforce)
+            set_allowed_admin_ranges_json "${ALLOWED_ADMIN_RANGES_JSON}"
+            return 0
+            ;;
+
+        disable)
+            set_allowed_admin_ranges_json "[]"
+            return 0
+            ;;
+
+        ask|"")
+            echo
+            echo "allowed_admin_ranges control"
+            echo "============================"
+            echo
+            echo "Current value:"
+            echo "  ${current_ranges}"
+            echo
+            echo "Configured value in this script:"
+            echo "  ${ALLOWED_ADMIN_RANGES_JSON}"
+            echo
+            echo "Important:"
+            echo "  If allowed_admin_ranges is non-empty, admin actions must come from those IP/CIDR ranges."
+            echo "  Include your VPN, office public IP or trusted admin subnet before enforcing this."
+            echo "  If Nextcloud is behind a reverse proxy, trusted_proxies and forwarded_for_headers must be correct."
+            echo
+            echo "Choose:"
+            echo "  1) Leave unchanged"
+            echo "  2) Set configured value from script"
+            echo "  3) Enter JSON array now"
+            echo "  4) Disable restriction - set []"
+            echo "  5) Abort"
+            echo
+            read -r -p "Choice [1/2/3/4/5]: " choice
+
+            case "${choice}" in
+                1|"")
+                    log "Leaving allowed_admin_ranges unchanged"
+                    ;;
+                2)
+                    set_allowed_admin_ranges_json "${ALLOWED_ADMIN_RANGES_JSON}"
+                    ;;
+                3)
+                    echo
+                    echo "Enter JSON array, example:"
+                    echo '  ["198.51.100.10/32","2001:db8::/64"]'
+                    echo
+                    read -r -p "allowed_admin_ranges JSON: " custom_json
+                    set_allowed_admin_ranges_json "${custom_json}"
+                    ;;
+                4)
+                    set_allowed_admin_ranges_json "[]"
+                    ;;
+                5)
+                    echo "Aborted."
+                    exit 0
+                    ;;
+                *)
+                    echo "Invalid choice."
+                    exit 1
+                    ;;
+            esac
+            ;;
+
+        *)
+            fail "Invalid ALLOWED_ADMIN_RANGES_MODE value: ${ALLOWED_ADMIN_RANGES_MODE}"
+            ;;
+    esac
+}
+
+manage_security_config() {
+    log "Running production security config checks"
+
+    check_and_control_debug
+    control_allowed_admin_ranges
+
+    log "Production security config checks completed"
+}
+
+restart_apache() {
+    if systemctl cat "${WEB_SERVICE}.service" >/dev/null 2>&1; then
+        log "Restarting service: ${WEB_SERVICE}"
+        systemctl "${SERVICE_ACTION}" "${WEB_SERVICE}" >> "${LOG_FILE}" 2>&1 \
+            || fail "Could not ${SERVICE_ACTION} ${WEB_SERVICE}"
+    else
+        log "Service not found, skipping: ${WEB_SERVICE}"
+    fi
+}
+
+run_final_setupchecks() {
+    if [[ "${RUN_SETUPCHECKS}" != "true" ]]; then
+        log "Skipping setupchecks because RUN_SETUPCHECKS=${RUN_SETUPCHECKS}"
+        return 0
+    fi
+
+    log "Running final setup checks: occ setupchecks"
+
+    if run_as_web setupchecks > "${BACKUP_DIR}/setupchecks-after.txt" 2>> "${LOG_FILE}"; then
+        log "Setupchecks completed"
+    else
+        log "Setupchecks completed with warnings/errors. See ${BACKUP_DIR}/setupchecks-after.txt and ${LOG_FILE}"
+    fi
+
+    cat "${BACKUP_DIR}/setupchecks-after.txt" >> "${LOG_FILE}" || true
+}
+
+final_check() {
+    local debug_value ranges_value theme_value
+
+    log "Running final status check"
+    run_as_web status | tee -a "${LOG_FILE}"
+
+    echo
+    echo "Theme:"
+    theme_value="$(run_as_web config:system:get theme 2>/dev/null || true)"
+    echo "  ${theme_value:-none}"
+
+    echo
+    echo "Debug:"
+    debug_value="$(get_config_value debug || true)"
+    echo "  ${debug_value:-false/not set}"
+
+    echo
+    echo "allowed_admin_ranges:"
+    ranges_value="$(get_config_value allowed_admin_ranges || true)"
+    echo "  ${ranges_value:-[]}"
+
+    echo
+    echo "Maintenance mode:"
+    run_as_web maintenance:mode || true
+
+    echo
+    echo "Update finished."
+    echo
+    echo "Backup directory:"
+    echo "  ${BACKUP_DIR}"
+    echo
