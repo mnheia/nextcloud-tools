@@ -50,7 +50,12 @@ echo "Setting base ownership"
 chown -R "${ROOTUSER}:${HTGROUP}" "$NCPATH"
 
 echo "Setting writable Nextcloud directories"
-for dir in   "$NCPATH/apps"   "$NCPATH/config"   "$NCPATH/data"   "$NCPATH/themes"   "$NCPATH/updater"
+for dir in \
+  "$NCPATH/apps" \
+  "$NCPATH/config" \
+  "$NCPATH/data" \
+  "$NCPATH/themes" \
+  "$NCPATH/updater"
 do
   if [ -d "$dir" ]; then
     chown -R "${HTUSER}:${HTGROUP}" "$dir"
