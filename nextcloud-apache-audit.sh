@@ -274,3 +274,210 @@ set +o pipefail
     echo "Apache error rows:  $(count_lines "$ERROR_RAW")"
     echo "Nextcloud rows:     $(count_lines "$NC_RAW")"
     echo "jq available:       $([[ $JQ_AVAILABLE -eq 1 ]] && echo yes || echo no)"
+    echo "NC desktop minimum: $NC_MIN_DESKTOP_VERSION"
+
+    section "1. Apache - top client IPs by request count"
+    awk -F '\t' '$1 != "-" { c[$1]++ } END { for (ip in c) print c[ip], ip }' "$ACCESS_TSV" \
+        | sort -nr | head -n "$TOP_N"
+
+    section "2. Apache - unusually high request volume"
+    awk -F '\t' -v t="$THRESH_TOTAL_REQUESTS" '
+        $1 != "-" { c[$1]++ }
+        END { for (ip in c) if (c[ip] >= t) print c[ip], ip }
+    ' "$ACCESS_TSV" | sort -nr
+
+    section "3. Apache - authentication/access failures (401/403)"
+    awk -F '\t' -v t="$THRESH_AUTH_HTTP" '
+        ($4 == "401" || $4 == "403") && $1 != "-" { c[$1]++ }
+        END { for (ip in c) if (c[ip] >= t) print c[ip], ip }
+    ' "$ACCESS_TSV" | sort -nr | head -n "$TOP_N"
+
+    section "4. Apache - 404 scanning/noise candidates"
+    awk -F '\t' -v t="$THRESH_404" '
+        $4 == "404" && $1 != "-" { c[$1]++ }
+        END { for (ip in c) if (c[ip] >= t) print c[ip], ip }
+    ' "$ACCESS_TSV" | sort -nr | head -n "$TOP_N"
+
+    section "5. Apache - 429 rate-limit responses"
+    awk -F '\t' '$4 == "429" && $1 != "-" { c[$1]++ } END { for (ip in c) print c[ip], ip }' "$ACCESS_TSV" \
+        | sort -nr | head -n "$TOP_N"
+
+    section "6. Apache - 5xx responses by client IP"
+    awk -F '\t' -v t="$THRESH_5XX" '
+        $4 ~ /^5[0-9][0-9]$/ && $1 != "-" { c[$1]++ }
+        END { for (ip in c) if (c[ip] >= t) print c[ip], ip }
+    ' "$ACCESS_TSV" | sort -nr | head -n "$TOP_N"
+
+    section "7. Nextcloud desktop clients - legacy/5xx DAV activity"
+    # Nextcloud desktop clients identify themselves with a mirall/<version> token.
+    # Aggregate DAV/5xx activity and flag clients below NC_MIN_DESKTOP_VERSION.
+    awk -F '\t' -v minver="$NC_MIN_DESKTOP_VERSION" '
+        function verlt(A,B,   na,nb,n,a,b,i,ai,bi) {
+            na=split(A,a,"."); nb=split(B,b,"."); n=(na>nb?na:nb)
+            for (i=1;i<=n;i++) {
+                ai=(i<=na ? a[i]+0 : 0); bi=(i<=nb ? b[i]+0 : 0)
+                if (ai < bi) return 1
+                if (ai > bi) return 0
+            }
+            return 0
+        }
+        {
+            ua=$5
+            low=tolower(ua)
+            if (match(low, /mirall\/[0-9]+(\.[0-9]+)*/)) {
+                ver=substr(low, RSTART+7, RLENGTH-7)
+                user=($6=="" ? "-" : $6)
+                key=$1 SUBSEP user SUBSEP ver SUBSEP $4 SUBSEP $2 SUBSEP $3
+                c[key]++
+                versions[$1 SUBSEP user SUBSEP ver]++
+            }
+        }
+        END {
+            found=0
+            for (key in c) {
+                split(key,k,SUBSEP)
+                ip=k[1]; user=k[2]; ver=k[3]; status=k[4]; method=k[5]; uri=k[6]
+                if (verlt(ver,minver) || status ~ /^5/) {
+                    sev=(verlt(ver,minver) ? "LEGACY" : "CHECK")
+                    printf "%d %s ip=%s user=%s client=%s status=%s method=%s uri=%s\n", c[key],sev,ip,user,ver,status,method,uri
+                    found=1
+                }
+            }
+            if (!found) print "No legacy or 5xx Nextcloud desktop-client activity detected."
+        }
+    ' "$ACCESS_TSV" | sort -nr | head -n 100
+
+    section "8. Apache - suspicious request methods"
+    # WebDAV methods used by Nextcloud are intentionally NOT flagged.
+    awk -F '\t' '
+        $2 ~ /^(TRACE|TRACK|CONNECT|DEBUG)$/ {
+            print $1, $2, $4, $3
+        }
+    ' "$ACCESS_TSV" | head -n 100
+
+    section "9. Apache - exploit/scanner URI probes"
+    awk -F '\t' '
+        {
+            u=tolower($3)
+            if (u ~ /(\/\.env([\/?]|$)|\/\.git([\/?]|$)|wp-admin|wp-login\.php|xmlrpc\.php|phpmyadmin|pma\/|\/cgi-bin\/|vendor\/phpunit|eval-stdin\.php|\/etc\/passwd|proc\/self\/environ|\.\.%2f|%2e%2e|\.\.\/|<script|%3cscript|union([+%20]|[[:space:]])+select|information_schema|sleep\([0-9]+\)|benchmark\()/)
+                print $1, $4, $2, $3
+        }
+    ' "$ACCESS_TSV" | head -n 200
+
+    section "10. Apache - known scanner user-agents"
+    awk -F '\t' '
+        {
+            ua=tolower($5)
+            if (ua ~ /(sqlmap|nikto|masscan|nmap scripting engine|acunetix|nessus|wpscan|gobuster|dirbuster|zgrab|nuclei|whatweb|feroxbuster)/)
+                print $1, $4, $2, $5
+        }
+    ' "$ACCESS_TSV" | head -n 100
+
+    section "11. Apache - top requested 404 paths"
+    awk -F '\t' '$4 == "404" { c[$3]++ } END { for (u in c) print c[u], u }' "$ACCESS_TSV" \
+        | sort -nr | head -n "$TOP_N"
+
+    section "12. Apache error log - security/error indicators"
+    grep -Eai \
+        'client denied|access denied|AH[0-9]+:.*denied|invalid URI|script not found|File does not exist|ModSecurity|mod_security|segfault|core dump|PHP (Fatal|Parse) error|proxy_fcgi:error|Premature end of script headers|SSL Library Error|certificate.*(failed|error)|request failed|malformed|invalid method' \
+        "$ERROR_RAW" | head -n 200 || true
+
+    section "13. Apache error log - client IPs mentioned most often"
+    awk '
+        {
+            if (match($0, /\[client[[:space:]]+[^]]+\]/)) {
+                x=substr($0, RSTART, RLENGTH)
+                sub(/^\[client[[:space:]]+/, "", x)
+                sub(/\]$/, "", x)
+                sub(/:[0-9]+$/, "", x)
+                if (x != "") c[x]++
+            }
+        }
+        END { for (ip in c) print c[ip], ip }
+    ' "$ERROR_RAW" | sort -nr | head -n "$TOP_N"
+
+    section "14. Apache mod_evasive - denied clients"
+    if grep -Eqi '\[evasive20:error\]' "$ERROR_RAW"; then
+        awk '
+            /\[evasive20:error\]/ {
+                ip="-"
+                if (match($0, /\[client[[:space:]]+[^]]+\]/)) {
+                    x=substr($0,RSTART,RLENGTH)
+                    sub(/^\[client[[:space:]]+/,"",x); sub(/\]$/,"",x); sub(/:[0-9]+$/,"",x)
+                    ip=x
+                }
+                c[ip]++
+                last[ip]=$0
+            }
+            END {
+                for (ip in c) {
+                    scope="PUBLIC"
+                    if (ip ~ /^127\./ || ip ~ /^10\./ || ip ~ /^192\.168\./ || ip ~ /^172\.(1[6-9]|2[0-9]|3[01])\./) scope="PRIVATE"
+                    printf "%d %s %s\n", c[ip], scope, ip
+                }
+            }
+        ' "$ERROR_RAW" | sort -nr | head -n "$TOP_N"
+        echo
+        echo "Recent examples:"
+        grep -Ei '\[evasive20:error\]' "$ERROR_RAW" | tail -20 || true
+    else
+        echo "No mod_evasive denials in the lookback window."
+    fi
+
+    section "15. Nextcloud - login/brute-force/security messages"
+    if [[ $JQ_AVAILABLE -eq 1 ]]; then
+        awk -F '\t' '
+            {
+                m=tolower($6)
+                if (m ~ /(login failed|failed login|brute.?force|invalid password|password.*invalid|two-factor.*failed|authentication.*failed|could not verify|not authenticated)/)
+                    print $1, $2, $3, $4, "level=" $5, $6
+            }
+        ' "$NC_TSV" | head -n 200
+    else
+        grep -Eai \
+            'login failed|failed login|brute.?force|invalid password|two-factor.*failed|authentication.*failed|could not verify' \
+            "$NC_RAW" | head -n 200 || true
+    fi
+
+    section "16. Nextcloud - IPs with repeated authentication failures"
+    if [[ $JQ_AVAILABLE -eq 1 ]]; then
+        awk -F '\t' -v t="$THRESH_NC_AUTH" '
+            {
+                m=tolower($6)
+                if (m ~ /(login failed|failed login|brute.?force|invalid password|password.*invalid|two-factor.*failed|authentication.*failed|could not verify|not authenticated)/ && $2 != "-")
+                    c[$2]++
+            }
+            END { for (ip in c) if (c[ip] >= t) print c[ip], ip }
+        ' "$NC_TSV" | sort -nr | head -n "$TOP_N"
+    else
+        echo "jq not installed: structured Nextcloud IP ranking unavailable."
+    fi
+
+    section "17. Nextcloud - security-relevant application messages"
+    if [[ $JQ_AVAILABLE -eq 1 ]]; then
+        awk -F '\t' '
+            {
+                m=tolower($6)
+                if (m ~ /(trusted domain|csrf|request token|not authorized|access denied|forbidden|signature.*(invalid|failed)|certificate.*(invalid|failed)|local access rules|not allowed|security|suspicious)/)
+                    print $1, $2, $3, $4, "level=" $5, $6
+            }
+        ' "$NC_TSV" | head -n 200
+    else
+        grep -Eai \
+            'trusted domain|csrf|request token|not authorized|access denied|forbidden|signature.*(invalid|failed)|local access rules|suspicious' \
+            "$NC_RAW" | head -n 200 || true
+    fi
+
+    section "18. Nextcloud - warnings/errors by app"
+    if [[ $JQ_AVAILABLE -eq 1 ]]; then
+        awk -F '\t' '$5 ~ /^[0-9]+$/ && $5 >= 2 { c[$4]++ } END { for (app in c) print c[app], app }' "$NC_TSV" \
+            | sort -nr | head -n "$TOP_N"
+    else
+        echo "jq not installed: structured app/error statistics unavailable."
+    fi
+
+    section "19. Nextcloud - recent level >= 3 errors/fatals"
+    if [[ $JQ_AVAILABLE -eq 1 ]]; then
+        awk -F '\t' '$5 ~ /^[0-9]+$/ && $5 >= 3 { print $1, $2, $3, $4, "level=" $5, $6 }' "$NC_TSV" \
+            | head -n 200
+    else
