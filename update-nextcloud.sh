@@ -306,3 +306,260 @@ backup_database() {
     dbpass="$(get_config_value dbpassword || true)"
     dbhost="$(get_config_value dbhost || true)"
 
+    [[ -n "${dbtype}" ]] || fail "Could not detect database type from config.php"
+    [[ -n "${dbname}" ]] || fail "Could not detect database name from config.php"
+
+    log "Detected database type: ${dbtype}"
+    log "Backing up database: ${dbname}"
+
+    case "${dbtype}" in
+        mysql|mysqli)
+            local dump_bin mysql_args host port socket defaults_file rc
+
+            [[ -n "${dbuser}" ]] || fail "Could not detect database user from config.php"
+            [[ -n "${dbpass}" ]] || fail "Database password is empty. Check dbpassword in ${NC_DIR}/config/config.php"
+
+            if command -v mariadb-dump >/dev/null 2>&1; then
+                dump_bin="mariadb-dump"
+            elif command -v mysqldump >/dev/null 2>&1; then
+                dump_bin="mysqldump"
+            else
+                fail "mariadb-dump or mysqldump is missing"
+            fi
+
+            dump_file="${BACKUP_DIR}/database-${dbname}-${DATE}.sql"
+
+            log "Database config check: dbuser=${dbuser}, dbhost=${dbhost:-localhost}, dbpassword_length=${#dbpass}"
+
+            defaults_file="$(mktemp "${BACKUP_DIR}/mariadb-client.XXXXXX.cnf")"
+            TEMP_FILES+=("${defaults_file}")
+            chmod 600 "${defaults_file}"
+
+            {
+                printf '[client]\n'
+                printf 'user=%s\n' "${dbuser}"
+                printf 'password=%s\n' "${dbpass}"
+            } > "${defaults_file}"
+
+            mysql_args=(--single-transaction --default-character-set=utf8mb4)
+
+            if [[ -z "${dbhost}" ]]; then
+                mysql_args+=(-h "localhost")
+            elif [[ "${dbhost}" == *":/"* ]]; then
+                host="${dbhost%%:*}"
+                socket="${dbhost#*:}"
+                [[ -n "${host}" ]] && mysql_args+=(-h "${host}")
+                mysql_args+=(--socket="${socket}")
+            elif [[ "${dbhost}" == /* ]]; then
+                mysql_args+=(--socket="${dbhost}")
+            elif [[ "${dbhost}" == *":"* ]]; then
+                host="${dbhost%%:*}"
+                port="${dbhost##*:}"
+                mysql_args+=(-h "${host}" -P "${port}")
+            else
+                mysql_args+=(-h "${dbhost}")
+            fi
+
+            set +e
+            "${dump_bin}" --defaults-extra-file="${defaults_file}" "${mysql_args[@]}" "${dbname}" > "${dump_file}"
+            rc=$?
+            set -e
+
+            rm -f "${defaults_file}"
+
+            if [[ "${rc}" -ne 0 ]]; then
+                rm -f "${dump_file}" || true
+                fail "Database backup failed with exit code ${rc}"
+            fi
+
+            [[ -s "${dump_file}" ]] || fail "Database backup is empty: ${dump_file}"
+            ;;
+
+        pgsql)
+            command -v pg_dump >/dev/null 2>&1 || fail "pg_dump is missing"
+
+            [[ -n "${dbuser}" ]] || fail "Could not detect database user from config.php"
+
+            dump_file="${BACKUP_DIR}/database-${dbname}-${DATE}.sql"
+
+            PGPASSWORD="${dbpass}" pg_dump \
+                -h "${dbhost:-localhost}" \
+                -U "${dbuser}" \
+                -F p \
+                "${dbname}" > "${dump_file}"
+
+            [[ -s "${dump_file}" ]] || fail "Database backup is empty: ${dump_file}"
+            ;;
+
+        sqlite3)
+            local sqlite_path
+
+            sqlite_path="${NC_DIR}/data/${dbname}"
+            [[ -f "${sqlite_path}" ]] || fail "SQLite database file not found: ${sqlite_path}"
+
+            cp -a "${sqlite_path}" "${BACKUP_DIR}/database-sqlite-${DATE}.sqlite3"
+            ;;
+
+        *)
+            fail "Unsupported database type: ${dbtype}"
+            ;;
+    esac
+
+    log "Database backup completed"
+}
+
+backup_files() {
+    log "Backing up config directory"
+    rsync -Aavx --delete "${NC_DIR}/config/" "${BACKUP_DIR}/config/" >> "${LOG_FILE}" 2>&1
+
+    log "Backing up apps directory"
+    rsync -Aavx --delete "${NC_DIR}/apps/" "${BACKUP_DIR}/apps/" >> "${LOG_FILE}" 2>&1
+
+    log "Backing up themes directory"
+    rsync -Aavx --delete "${NC_DIR}/themes/" "${BACKUP_DIR}/themes/" >> "${LOG_FILE}" 2>&1
+
+    if custom_theme_enabled; then
+        CUSTOM_THEME_DIR="${NC_DIR}/themes/${CUSTOM_THEME_NAME}"
+        log "Backing up custom theme explicitly: ${CUSTOM_THEME_NAME}"
+        rsync -Aavx --delete "${CUSTOM_THEME_DIR}/" "${BACKUP_DIR}/theme-${CUSTOM_THEME_NAME}/" >> "${LOG_FILE}" 2>&1
+    else
+        log "No custom theme configured, skipping explicit custom theme backup"
+    fi
+
+    log "Backing up updater directory"
+    rsync -Aavx --delete "${NC_DIR}/updater/" "${BACKUP_DIR}/updater/" >> "${LOG_FILE}" 2>&1
+
+    log "Saving Nextcloud app list before update"
+    run_as_web app:list > "${BACKUP_DIR}/app-list-before.txt" 2>> "${LOG_FILE}" || true
+
+    log "Saving Nextcloud status before update"
+    run_as_web status > "${BACKUP_DIR}/status-before.txt" 2>> "${LOG_FILE}" || true
+
+    if [[ "${BACKUP_DATA}" == "true" ]]; then
+        local data_dir
+        data_dir="$(get_data_dir)"
+
+        if [[ -d "${data_dir}" ]]; then
+            log "Backing up data directory: ${data_dir}"
+            rsync -Aavx "${data_dir}/" "${BACKUP_DIR}/data/" >> "${LOG_FILE}" 2>&1
+        else
+            fail "BACKUP_DATA=true but data directory was not found: ${data_dir}"
+        fi
+    else
+        log "Data directory backup skipped by setting BACKUP_DATA=${BACKUP_DATA}"
+    fi
+}
+
+check_known_updater_blockers() {
+    local blockers=("assets")
+    local rel path target_dir choice confirm_delete
+
+    for rel in "${blockers[@]}"; do
+        path="${NC_DIR}/${rel}"
+
+        if [[ -e "${path}" ]]; then
+            echo
+            echo "Known Nextcloud updater blocker found:"
+            echo "  ${path}"
+            echo
+            echo "The Nextcloud updater may fail with:"
+            echo "  Unknown files detected within the installation folder: ${rel}"
+            echo
+            echo "Choose:"
+            echo "  1) Move it to the backup folder - recommended"
+            echo "  2) Delete it"
+            echo "  3) Leave it and continue anyway"
+            echo "  4) Abort"
+            echo
+            read -r -p "Choice [1/2/3/4]: " choice
+
+            case "${choice}" in
+                1|"")
+                    target_dir="${BACKUP_DIR}/moved-before-update"
+                    mkdir -p "${target_dir}"
+                    log "Moving updater blocker ${path} to ${target_dir}/${rel}"
+                    mv "${path}" "${target_dir}/${rel}"
+                    ;;
+                2)
+                    read -r -p "Type DELETE to remove ${path}: " confirm_delete
+
+                    if [[ "${confirm_delete}" == "DELETE" ]]; then
+                        log "Deleting updater blocker ${path}"
+                        rm -rf -- "${path}"
+                    else
+                        echo "Delete not confirmed. Aborting."
+                        exit 1
+                    fi
+                    ;;
+                3)
+                    log "Leaving updater blocker in place: ${path}"
+                    ;;
+                4)
+                    echo "Aborted."
+                    exit 0
+                    ;;
+                *)
+                    echo "Invalid choice."
+                    exit 1
+                    ;;
+            esac
+        fi
+    done
+}
+
+set_maintenance_on() {
+    log "Enabling maintenance mode"
+    run_as_web maintenance:mode --on >> "${LOG_FILE}" 2>&1 || fail "Could not enable maintenance mode"
+}
+
+set_maintenance_off() {
+    log "Disabling maintenance mode"
+    run_as_web maintenance:mode --off >> "${LOG_FILE}" 2>&1 || fail "Could not disable maintenance mode"
+}
+
+chmod_core_tree() {
+    log "Applying chmod to Nextcloud core tree, excluding data directory"
+
+    find "${NC_DIR}" \
+        -path "${NC_DIR}/data" -prune -o \
+        -type f -exec chmod 0640 {} \; >> "${LOG_FILE}" 2>&1
+
+    find "${NC_DIR}" \
+        -path "${NC_DIR}/data" -prune -o \
+        -type d -exec chmod 0750 {} \; >> "${LOG_FILE}" 2>&1
+
+    chmod +x "${NC_DIR}/occ"
+
+    if [[ -f "${NC_DIR}/.htaccess" ]]; then
+        chmod 0644 "${NC_DIR}/.htaccess"
+    fi
+
+    if [[ -f "${NC_DIR}/data/.htaccess" ]]; then
+        chmod 0644 "${NC_DIR}/data/.htaccess"
+    fi
+}
+
+apply_update_permissions() {
+    log "Switching Nextcloud installation to update permissions"
+
+    echo
+    echo "Temporarily setting Nextcloud code ownership to:"
+    echo "  ${WEB_USER}:${WEB_GROUP}"
+    echo
+    echo "This is required because the updater must overwrite core files."
+    echo
+
+    chown "${WEB_USER}:${WEB_GROUP}" "${NC_DIR}"
+
+    while IFS= read -r -d '' item; do
+        chown -R "${WEB_USER}:${WEB_GROUP}" "${item}" >> "${LOG_FILE}" 2>&1
+    done < <(find "${NC_DIR}" -mindepth 1 -maxdepth 1 -not -name "data" -print0)
+
+    if [[ "${TOUCH_DATA_PERMISSIONS}" == "true" && -d "${NC_DIR}/data" ]]; then
+        log "Also touching data directory permissions because TOUCH_DATA_PERMISSIONS=true"
+        chown -R "${WEB_USER}:${WEB_GROUP}" "${NC_DIR}/data" >> "${LOG_FILE}" 2>&1
+    fi
+
+    chmod_core_tree
+
+    if [[ -d "${NC_DIR}/data" ]]; then
