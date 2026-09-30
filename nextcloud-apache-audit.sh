@@ -354,7 +354,7 @@ set +o pipefail
     awk -F '\t' '
         {
             u=tolower($3)
-            if (u ~ /(\/\.env([\/?]|$)|\/\.git([\/?]|$)|wp-admin|wp-login\.php|xmlrpc\.php|phpmyadmin|pma\/|\/cgi-bin\/|vendor\/phpunit|eval-stdin\.php|\/etc\/passwd|proc\/self\/environ|\.\.%2f|%2e%2e|\.\.\/<|<script|%3cscript|union([+%20]|[[:space:]])+select|information_schema|sleep\([0-9]+\)|benchmark\()/)
+            if (u ~ /(\/\.env([\/?]|$)|\/\.git([\/?]|$)|wp-admin|wp-login\.php|xmlrpc\.php|phpmyadmin|pma\/|\/cgi-bin\/|vendor\/phpunit|eval-stdin\.php|\/etc\/passwd|proc\/self\/environ|\.\.%2f|%2e%2e|\.\.\/|<script|%3cscript|union([+%20]|[[:space:]])+select|information_schema|sleep\([0-9]+\)|benchmark\()/)
                 print $1, $4, $2, $3
         }
     ' "$ACCESS_TSV" | head -n 200
