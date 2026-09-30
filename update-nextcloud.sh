@@ -1130,3 +1130,165 @@ final_check() {
     echo "Backup directory:"
     echo "  ${BACKUP_DIR}"
     echo
+    echo "Log file:"
+    echo "  ${LOG_FILE}"
+    echo
+    echo "Additional reports:"
+    echo "  ${BACKUP_DIR}/integrity-check-core-after.txt"
+    echo "  ${BACKUP_DIR}/setupchecks-after.txt"
+    echo
+    echo "Recommended manual checks:"
+    echo "  - Open the Nextcloud web UI"
+    echo "  - Check Administration settings > Overview"
+    if custom_theme_enabled; then
+        echo "  - Confirm the custom theme is active"
+    fi
+    echo "  - Confirm admin actions still work if allowed_admin_ranges was changed"
+}
+
+confirm() {
+    local current_version current_theme current_debug current_ranges answer
+
+    current_version="$(run_as_web status 2>/dev/null | awk -F': ' '/version:/ {print $2}' | xargs || true)"
+    current_theme="$(run_as_web config:system:get theme 2>/dev/null || true)"
+    current_debug="$(get_config_value debug || true)"
+    current_ranges="$(get_config_value allowed_admin_ranges || true)"
+    [[ -n "${current_ranges}" ]] || current_ranges="[]"
+
+    echo
+    echo "Nextcloud update plan"
+    echo "====================="
+    echo
+    echo "Nextcloud directory:"
+    echo "  ${NC_DIR}"
+    echo
+    echo "Detected version:"
+    echo "  ${current_version:-unknown}"
+    echo
+    echo "Custom theme:"
+    if custom_theme_enabled; then
+        echo "  enabled: ${CUSTOM_THEME_NAME}"
+        echo "  directory: ${NC_DIR}/themes/${CUSTOM_THEME_NAME}"
+        echo
+        echo "Current configured theme:"
+        echo "  ${current_theme:-none}"
+        echo
+        echo "Theme that will be enforced after upgrade:"
+        echo "  ${CUSTOM_THEME_NAME}"
+    else
+        echo "  none configured"
+        echo
+        echo "Current configured theme:"
+        echo "  ${current_theme:-none}"
+        echo
+        echo "Theme enforcement after upgrade:"
+        echo "  skipped"
+    fi
+    echo
+    echo "Current debug value:"
+    echo "  ${current_debug:-false/not set}"
+    echo
+    echo "Current allowed_admin_ranges:"
+    echo "  ${current_ranges}"
+    echo
+    echo "Backup target:"
+    echo "  ${BACKUP_DIR}"
+    echo
+    echo "Apache action after upgrade:"
+    echo "  systemctl ${SERVICE_ACTION} ${WEB_SERVICE}"
+    echo
+    echo "Permission behavior:"
+    echo "  - before updater: temporarily set Nextcloud code to ${WEB_USER}:${WEB_GROUP}"
+    echo "  - after updater: restore locked root:${WEB_GROUP} permission model"
+    echo "  - root-level assets directory will not be recreated"
+    echo
+    echo "Database backup behavior:"
+    echo "  - MariaDB/MySQL credentials are passed using a temporary --defaults-extra-file"
+    echo "  - temporary credential file is removed after dump"
+    echo
+    echo "Post-upgrade maintenance:"
+    echo "  - occ maintenance:repair --include-expensive: ${RUN_EXPENSIVE_REPAIR}"
+    echo "  - occ db:add-missing-indices: ${RUN_MISSING_INDICES}"
+    echo "  - occ db:add-missing-columns: ${RUN_MISSING_COLUMNS}"
+    echo "  - occ db:add-missing-primary-keys: ${RUN_MISSING_PRIMARY_KEYS}"
+    echo "  - occ db:convert-filecache-bigint: ${RUN_FILECACHE_BIGINT}"
+    echo
+    echo "Security/config checks:"
+    echo "  - debug production check: ${CHECK_DEBUG_PRODUCTION}"
+    echo "  - auto-disable debug: ${AUTO_DISABLE_DEBUG}"
+    echo "  - allowed_admin_ranges mode: ${ALLOWED_ADMIN_RANGES_MODE}"
+    echo "  - configured allowed_admin_ranges: ${ALLOWED_ADMIN_RANGES_JSON}"
+    echo
+    echo "Final checks:"
+    echo "  - occ integrity:check-core: ${RUN_CORE_INTEGRITY}"
+    echo "  - occ setupchecks: ${RUN_SETUPCHECKS}"
+    echo
+    echo "Special handling:"
+    echo "  - if updater.phar fails only because PHP system() is disabled after successful code update,"
+    echo "    this script continues with manual occ upgrade"
+    echo
+    echo "This will:"
+    echo "  - check for known updater blockers"
+    echo "  - enable maintenance mode"
+    echo "  - back up database, config, apps, themes and updater directory"
+    if custom_theme_enabled; then
+        echo "  - explicitly back up custom theme=${CUSTOM_THEME_NAME}"
+    else
+        echo "  - skip explicit custom theme handling"
+    fi
+    echo "  - optionally back up the data directory if BACKUP_DATA=true"
+    echo "  - temporarily relax permissions for update"
+    echo "  - run updater.phar --no-interaction"
+    echo "  - run occ upgrade"
+    echo "  - run maintenance:repair and maintenance:update:htaccess"
+    if custom_theme_enabled; then
+        echo "  - re-apply theme=${CUSTOM_THEME_NAME}"
+        echo "  - run maintenance:theme:update"
+    else
+        echo "  - skip theme re-apply"
+    fi
+    echo "  - run database repair/index/column/key maintenance if enabled"
+    echo "  - run core integrity check if enabled"
+    echo "  - check/control debug and allowed_admin_ranges"
+    echo "  - restore locked-down permissions"
+    echo "  - disable maintenance mode"
+    echo "  - ${SERVICE_ACTION} ${WEB_SERVICE}"
+    echo "  - run setupchecks if enabled"
+    echo
+    read -r -p "Continue? Type YES: " answer
+
+    if [[ "${answer}" != "YES" ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+}
+
+main() {
+    require_root
+    acquire_lock
+    preflight
+    check_for_server_update
+    choose_backup_dir
+    check_known_updater_blockers
+    safe_copy_config_snapshot
+    confirm
+
+    log "Starting update procedure"
+
+    set_maintenance_on
+    backup_database
+    backup_files
+    apply_update_permissions
+    run_update
+    post_update
+    run_expensive_post_upgrade_maintenance
+    run_core_integrity_check
+    manage_security_config
+    restore_locked_permissions
+    set_maintenance_off
+    restart_apache
+    run_final_setupchecks
+    final_check
+}
+
+main "$@"
